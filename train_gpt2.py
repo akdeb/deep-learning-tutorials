@@ -12,6 +12,7 @@ class CausalSelfAttention(nn.Module):
 		self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
 
 		self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+		self.c_proj.NANOGPT_SCALE_INIT = 1
 
 		self.n_head = config.n_head
 		self.n_embd = config.n_embd
@@ -28,14 +29,20 @@ class CausalSelfAttention(nn.Module):
 		q = q.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
 		v = v.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
 
-		att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-		att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-		att = F.softmax(att, dim = -1)
+		# att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+		# att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+		# att = F.softmax(att, dim = -1)
+		# y = att @ v
 
-		y = att @ v
+		y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
 		y = y.transpose(1,2).contiguous().view(B, T, C)
 		y = self.c_proj(y)
 		return y
+
+class TanhGELU(nn.Module):
+	def forward(self, input):
+		return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
 
 class MLP(nn.Module):
 	def __init__(self, config):
@@ -43,6 +50,8 @@ class MLP(nn.Module):
 		self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
 		self.gelu = nn.GELU(approximate='tanh')
 		self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+		self.c_proj.NANOGPT_SCALE_INIT = 1
+
 
 	def forward(self, x):
 		x = self.c_fc(x)
@@ -111,11 +120,15 @@ class GPT(nn.Module):
 
 	def _init_weights(self, module):
 		if isinstance(module, nn.Linear):
-			torch.nn.init.noraml_(module.weight, mean=0.0, std=0.02)
+			std = 0.02
+			if hasattr(module, 'NANOGPT_SCALE_INIT'):
+				std *= (2 * self.config.n_layer) ** -0.5 
+
+			torch.nn.init.normal_(module.weight, mean=0.0, std=std)
 			if module.bias is not None:
 				torch.nn.init.zeros_(module.bias)
 		elif isinstance(module, nn.Embedding):
-			torch.nn.init.noraml_(module.weight, mean=0.0, std=0.02)
+			torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)  # Fixed: use 0.02 directly instead of undefined std
 	
 	@classmethod
 	def from_pretrained(cls, model_type):
@@ -190,52 +203,70 @@ class DataLoaderLite:
 		
 		return x, y
 
-	def get_batch(self, split):
-		if split == 'train':
-			ix = torch.randint(0, len(self.tokens) - self.T, (self.B,))
+	# def get_batch(self, split):
+	# 	if split == 'train':
+	# 		ix = torch.randint(0, len(self.tokens) - self.T, (self.B,))
 	
 
-	def get_batch(self):
-		ix = torch.randint(0, len(self.tokens) - self.T, (self.B,))
-		x = torch.tensor(self.tokens[ix:ix+self.T])
+	# def get_batch(self):
+	# 	ix = torch.randint(0, len(self.tokens) - self.T, (self.B,))
+	# 	x = torch.tensor(self.tokens[ix:ix+self.T])
 
 
+
+
+# import sys; sys.exit(0)
+
+# print("didn't crash yay!")
+import time
+device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+
+# generate!
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+	torch.cuda.manual_seed(1337)
+elif torch.backends.mps.is_available():
+	torch.mps.manual_seed(1337)
+else:
+	torch.manual_seed(1337)
+
+train_loader = DataLoaderLite(B=16, T=1024)
+torch.set_float32_matmul_precision('high')
+
+model = GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+# model = torch.compile(model, mode='reduce-overhead')
 
 # -----------------------------
 num_return_sequences = 5
 max_length = 30
-device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-
-
-train_loader = DataLoaderLite(B=4, T=32)
-
-# -----------------------------
-# get logits
-model = GPT(GPTConfig())
-model.to(device)
-# logits, loss = model(x, y)
-# print(logits.shape)	
-# print(loss)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+	t0 = time.time()
 	x, y = train_loader.next_batch()
 	x = x.to(device)
 	y = y.to(device)
 	optimizer.zero_grad()
-	logits, loss = model(x, y)
+	with torch.autocast(device_type=device, dtype=torch.bfloat16):
+		logits, loss = model(x, y)
+		# import code; code.interact(local=locals())
+	# import code; code.interact(local=locals())
 	loss.backward()
 	optimizer.step()
-	print(f"step {i}: loss {loss.item()}")
+	torch.mps.synchronize()
 
-import sys; sys.exit(0)
+	# if device == 'cuda':
+	# 	torch.cuda.synchronize()
+	# elif device == 'mps':
+	# 	torch.mps.synchronize()
+	
+	t1 = time.time()
+	dt = (t1 - t0) * 1000
+	tokens_per_second = (train_loader.B * train_loader.T) * 1000 / dt
+	print(f"step {i}: loss: {loss.item():.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_second:.2f}")
 
-# print("didn't crash yay!")
-
-
-# generate!
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+import sys; sys.exit(0);
 
 while x.size(1) < max_length:
 	with torch.no_grad():
